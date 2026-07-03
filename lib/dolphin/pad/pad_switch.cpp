@@ -1,9 +1,19 @@
 #include <dolphin/pad.h>
 
+#include <aurora/aurora.h>
+
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <switch.h>
+
+// The remap table is persisted under Aurora's user path (dusk::ConfigPath on Switch). Declared
+// here to avoid pulling in internal.hpp (fmt/SDL) which does not build in this libnx TU.
+namespace aurora {
+extern AuroraConfig g_config;
+}
 
 namespace {
 PadState s_pad{};
@@ -130,46 +140,170 @@ bool ensureSixAxisSensorStarted() {
   return true;
 }
 
+// --- Controller remapping -------------------------------------------------------------------
+// The controller-config UI drives the GC pad through the PAD*Mapping API. This backend keeps a
+// GC-button -> Switch-physical-button table (s_buttonMappings) that mapButtons() consults, so the
+// user can remap from the interface. Native button ids are offset past the SDL_GamepadButton
+// D-pad range (11-14) so the shared native_button_name() never mislabels them and instead falls
+// through to PADGetNativeButtonName(). Minus is intentionally absent: it stays the Dusk menu key
+// and cannot be bound.
+struct SwitchNativeButton {
+  u32 id;
+  u64 hidMask;
+  const char* name;
+};
+
+enum : u32 {
+  NBTN_A = 0x100,
+  NBTN_B,
+  NBTN_X,
+  NBTN_Y,
+  NBTN_L,
+  NBTN_R,
+  NBTN_ZL,
+  NBTN_ZR,
+  NBTN_PLUS,
+  NBTN_STICK_L,
+  NBTN_STICK_R,
+  NBTN_UP,
+  NBTN_DOWN,
+  NBTN_LEFT,
+  NBTN_RIGHT,
+};
+
+constexpr std::array<SwitchNativeButton, 15> kSwitchButtons = {{
+    {NBTN_A, HidNpadButton_A, "A"},
+    {NBTN_B, HidNpadButton_B, "B"},
+    {NBTN_X, HidNpadButton_X, "X"},
+    {NBTN_Y, HidNpadButton_Y, "Y"},
+    {NBTN_L, HidNpadButton_L, "L"},
+    {NBTN_R, HidNpadButton_R, "R"},
+    {NBTN_ZL, HidNpadButton_ZL, "ZL"},
+    {NBTN_ZR, HidNpadButton_ZR, "ZR"},
+    {NBTN_PLUS, HidNpadButton_Plus, "+"},
+    {NBTN_STICK_L, HidNpadButton_StickL, "L-Stick"},
+    {NBTN_STICK_R, HidNpadButton_StickR, "R-Stick"},
+    {NBTN_UP, HidNpadButton_Up, "D-Up"},
+    {NBTN_DOWN, HidNpadButton_Down, "D-Down"},
+    {NBTN_LEFT, HidNpadButton_Left, "D-Left"},
+    {NBTN_RIGHT, HidNpadButton_Right, "D-Right"},
+}};
+
+// Default GC <- Switch mapping. Mirrors the GameCube-style shoulder layout: GC L=ZL, GC R=ZR,
+// GC Z on the R bumper. (The old backend also let the L bumper trigger GC L; the single-button
+// remap model drops that redundancy — remap GC L to the L bumper if you prefer it.)
+constexpr std::array<PADButtonMapping, PAD_BUTTON_COUNT> kDefaultMapping = {{
+    {NBTN_LEFT, PAD_BUTTON_LEFT},
+    {NBTN_RIGHT, PAD_BUTTON_RIGHT},
+    {NBTN_DOWN, PAD_BUTTON_DOWN},
+    {NBTN_UP, PAD_BUTTON_UP},
+    {NBTN_R, PAD_TRIGGER_Z},
+    {NBTN_ZR, PAD_TRIGGER_R},
+    {NBTN_ZL, PAD_TRIGGER_L},
+    {NBTN_A, PAD_BUTTON_A},
+    {NBTN_B, PAD_BUTTON_B},
+    {NBTN_X, PAD_BUTTON_X},
+    {NBTN_Y, PAD_BUTTON_Y},
+    {NBTN_PLUS, PAD_BUTTON_START},
+}};
+
+std::array<PADButtonMapping, PAD_BUTTON_COUNT> s_buttonMappings = kDefaultMapping;
+bool s_mappingsLoaded = false;
+
+constexpr u32 kMappingMagic = 0x53504144;  // 'SPAD'
+constexpr u32 kMappingVersion = 1;
+
+u64 hidMaskForNative(u32 id) {
+  for (const auto& b : kSwitchButtons) {
+    if (b.id == id) {
+      return b.hidMask;
+    }
+  }
+  return 0;
+}
+
+bool isKnownNative(u32 id) {
+  if (id == PAD_NATIVE_BUTTON_INVALID) {
+    return true;
+  }
+  for (const auto& b : kSwitchButtons) {
+    if (b.id == id) {
+      return true;
+    }
+  }
+  return false;
+}
+
+std::filesystem::path mappingFilePath() {
+  if (aurora::g_config.userPath == nullptr) {
+    return {};
+  }
+  return std::filesystem::path{aurora::g_config.userPath} / "switch_pad_mapping.bin";
+}
+
+void saveMappings() {
+  const auto path = mappingFilePath();
+  if (path.empty()) {
+    return;
+  }
+  std::ofstream file(path, std::ios::binary | std::ios::trunc);
+  if (!file) {
+    return;
+  }
+  const u32 magic = kMappingMagic;
+  const u32 version = kMappingVersion;
+  file.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
+  file.write(reinterpret_cast<const char*>(&version), sizeof(version));
+  file.write(reinterpret_cast<const char*>(s_buttonMappings.data()),
+             sizeof(PADButtonMapping) * PAD_BUTTON_COUNT);
+}
+
+void loadMappings() {
+  s_mappingsLoaded = true;
+  s_buttonMappings = kDefaultMapping;
+
+  const auto path = mappingFilePath();
+  if (path.empty()) {
+    return;
+  }
+  std::ifstream file(path, std::ios::binary);
+  if (!file) {
+    return;
+  }
+  u32 magic = 0;
+  u32 version = 0;
+  file.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+  file.read(reinterpret_cast<char*>(&version), sizeof(version));
+  if (!file || magic != kMappingMagic || version != kMappingVersion) {
+    return;
+  }
+  std::array<PADButtonMapping, PAD_BUTTON_COUNT> loaded{};
+  file.read(reinterpret_cast<char*>(loaded.data()), sizeof(PADButtonMapping) * PAD_BUTTON_COUNT);
+  if (!file) {
+    return;
+  }
+  for (const auto& m : loaded) {
+    if (!isKnownNative(m.nativeButton)) {
+      return;  // corrupt/foreign file -> keep defaults
+    }
+  }
+  s_buttonMappings = loaded;
+}
+
+void ensureMappingsLoaded() {
+  if (!s_mappingsLoaded) {
+    loadMappings();
+  }
+}
+
 u16 mapButtons(u64 buttons) {
+  ensureMappingsLoaded();
   u16 out = 0;
-  if ((buttons & HidNpadButton_A) != 0) {
-    out |= PAD_BUTTON_A;
-  }
-  if ((buttons & HidNpadButton_B) != 0) {
-    out |= PAD_BUTTON_B;
-  }
-  if ((buttons & HidNpadButton_X) != 0) {
-    out |= PAD_BUTTON_X;
-  }
-  if ((buttons & HidNpadButton_Y) != 0) {
-    out |= PAD_BUTTON_Y;
-  }
-  if ((buttons & HidNpadButton_Plus) != 0) {
-    out |= PAD_BUTTON_START;
-  }
-  // GameCube-style shoulder layout: GC L=ZL, GC R=ZR, GC Z=R (the Switch R bumper, the
-  // natural home for GC's digital Z). Minus is reserved for the Dusk menu only — it used to
-  // also emit PAD_TRIGGER_Z, which leaked a Z press into the game every time you closed the menu.
-  if ((buttons & (HidNpadButton_L | HidNpadButton_ZL)) != 0) {
-    out |= PAD_TRIGGER_L;
-  }
-  if ((buttons & HidNpadButton_ZR) != 0) {
-    out |= PAD_TRIGGER_R;
-  }
-  if ((buttons & HidNpadButton_R) != 0) {
-    out |= PAD_TRIGGER_Z;
-  }
-  if ((buttons & HidNpadButton_Up) != 0) {
-    out |= PAD_BUTTON_UP;
-  }
-  if ((buttons & HidNpadButton_Down) != 0) {
-    out |= PAD_BUTTON_DOWN;
-  }
-  if ((buttons & HidNpadButton_Left) != 0) {
-    out |= PAD_BUTTON_LEFT;
-  }
-  if ((buttons & HidNpadButton_Right) != 0) {
-    out |= PAD_BUTTON_RIGHT;
+  for (const auto& m : s_buttonMappings) {
+    const u64 mask = hidMaskForNative(m.nativeButton);
+    if (mask != 0 && (buttons & mask) != 0) {
+      out |= m.padButton;
+    }
   }
   return out;
 }
@@ -203,15 +337,17 @@ u32 PADReadRaw(PADStatus* status) {
   const HidAnalogStickState left = padGetStickPos(&s_pad, 0);
   const HidAnalogStickState right = padGetStickPos(&s_pad, 1);
 
-  status[0].button = mapButtons(buttons);
+  const u16 padButtons = mapButtons(buttons);
+  status[0].button = padButtons;
   status[0].stickX = scaleStick(left.x);
   status[0].stickY = scaleStick(left.y);
   status[0].substickX = scaleStick(right.x);
   status[0].substickY = scaleStick(right.y);
-  status[0].triggerLeft = (buttons & (HidNpadButton_L | HidNpadButton_ZL)) != 0 ? 255 : 0;
-  status[0].triggerRight = (buttons & (HidNpadButton_R | HidNpadButton_ZR)) != 0 ? 255 : 0;
-  status[0].analogA = (buttons & HidNpadButton_A) != 0 ? 255 : 0;
-  status[0].analogB = (buttons & HidNpadButton_B) != 0 ? 255 : 0;
+  // Digital triggers follow whatever the remap routed to GC L/R/A/B (default: ZL/ZR/A/B).
+  status[0].triggerLeft = (padButtons & PAD_TRIGGER_L) != 0 ? 255 : 0;
+  status[0].triggerRight = (padButtons & PAD_TRIGGER_R) != 0 ? 255 : 0;
+  status[0].analogA = (padButtons & PAD_BUTTON_A) != 0 ? 255 : 0;
+  status[0].analogB = (padButtons & PAD_BUTTON_B) != 0 ? 255 : 0;
   status[0].err = PAD_ERR_NONE;
 #ifdef TARGET_PC
   status[0].extButton = 0;
@@ -313,19 +449,36 @@ void PADGetVidPid(u32 port, u32* vid, u32* pid) {
 void PADClearPort(u32 port) { (void)port; }
 const char* PADGetName(u32 port) { return port == 0 ? "Switch Controller" : nullptr; }
 void PADSetButtonMapping(u32 port, PADButtonMapping mapping) {
-  (void)port;
-  (void)mapping;
+  if (port != PAD_CHAN0) {
+    return;
+  }
+  ensureMappingsLoaded();
+  for (auto& m : s_buttonMappings) {
+    if (m.padButton == mapping.padButton) {
+      m.nativeButton = mapping.nativeButton;
+      break;
+    }
+  }
 }
 void PADSetAllButtonMappings(u32 port, PADButtonMapping buttons[PAD_BUTTON_COUNT]) {
-  (void)port;
-  (void)buttons;
+  if (port != PAD_CHAN0 || buttons == nullptr) {
+    return;
+  }
+  ensureMappingsLoaded();
+  std::copy(buttons, buttons + PAD_BUTTON_COUNT, s_buttonMappings.begin());
 }
 PADButtonMapping* PADGetButtonMappings(u32 port, u32* buttonCount) {
-  (void)port;
-  if (buttonCount != nullptr) {
-    *buttonCount = 0;
+  if (port != PAD_CHAN0) {
+    if (buttonCount != nullptr) {
+      *buttonCount = 0;
+    }
+    return nullptr;
   }
-  return nullptr;
+  ensureMappingsLoaded();
+  if (buttonCount != nullptr) {
+    *buttonCount = PAD_BUTTON_COUNT;
+  }
+  return s_buttonMappings.data();
 }
 void PADSetAxisMapping(u32 port, PADAxisMapping mapping) {
   (void)port;
@@ -342,7 +495,10 @@ PADAxisMapping* PADGetAxisMappings(u32 port, u32* axisCount) {
   }
   return nullptr;
 }
-void PADSerializeMappings() {}
+void PADSerializeMappings() {
+  ensureMappingsLoaded();
+  saveMappings();
+}
 
 BOOL PADSetKeyButtonBinding(u32 port, PADKeyButtonBinding binding) {
   (void)port;
@@ -355,11 +511,13 @@ BOOL PADSetKeyButtonBindings(u32 port, PADKeyButtonBinding bindings[PAD_BUTTON_C
   return FALSE;
 }
 PADKeyButtonBinding* PADGetKeyButtonBindings(u32 port, u32* buttonCount) {
+  // No keyboard on Switch. Returning null keeps the controller-config UI out of keyboard-binding
+  // mode (keyboard_active()), which otherwise waited forever for a keypress that never arrives.
   (void)port;
   if (buttonCount != nullptr) {
-    *buttonCount = PAD_BUTTON_COUNT;
+    *buttonCount = 0;
   }
-  return s_keyButtons.data();
+  return nullptr;
 }
 BOOL PADSetKeyAxisBinding(u32 port, PADKeyAxisBinding binding) {
   (void)port;
@@ -419,7 +577,11 @@ const char* PADGetButtonName(PADButton button) {
   }
 }
 const char* PADGetNativeButtonName(u32 button) {
-  (void)button;
+  for (const auto& b : kSwitchButtons) {
+    if (b.id == button) {
+      return b.name;
+    }
+  }
   return "";
 }
 const char* PADGetAxisName(PADAxis axis) {
@@ -444,14 +606,31 @@ struct SDL_Gamepad* PADGetSDLGamepadForIndex(u32 index) {
   return nullptr;
 }
 s32 PADGetNativeButtonPressed(u32 port) {
-  (void)port;
+  if (port != PAD_CHAN0) {
+    return -1;
+  }
+  ensureInitialized();
+  padUpdate(&s_pad);
+  const u64 held = padGetButtons(&s_pad);
+  for (const auto& b : kSwitchButtons) {
+    if ((held & b.hidMask) != 0) {
+      return static_cast<s32>(b.id);
+    }
+  }
   return -1;
 }
 PADSignedNativeAxis PADGetNativeAxisPulled(u32 port) {
   (void)port;
   return {-1, AXIS_SIGN_POSITIVE};
 }
-void PADRestoreDefaultMapping(u32 port) { (void)port; }
+void PADRestoreDefaultMapping(u32 port) {
+  if (port != PAD_CHAN0) {
+    return;
+  }
+  s_buttonMappings = kDefaultMapping;
+  s_mappingsLoaded = true;
+  saveMappings();
+}
 void PADBlockInput(bool block) { s_blockInput = block; }
 void PADSetDefaultMapping(const PADDefaultMapping* mapping, PADControllerType type) {
   (void)mapping;
