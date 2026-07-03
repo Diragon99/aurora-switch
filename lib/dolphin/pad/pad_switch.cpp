@@ -147,16 +147,16 @@ u16 mapButtons(u64 buttons) {
   if ((buttons & HidNpadButton_Plus) != 0) {
     out |= PAD_BUTTON_START;
   }
-  if ((buttons & HidNpadButton_Minus) != 0) {
-    out |= PAD_TRIGGER_Z;
-  }
+  // GameCube-style shoulder layout: GC L=ZL, GC R=ZR, GC Z=R (the Switch R bumper, the
+  // natural home for GC's digital Z). Minus is reserved for the Dusk menu only — it used to
+  // also emit PAD_TRIGGER_Z, which leaked a Z press into the game every time you closed the menu.
   if ((buttons & (HidNpadButton_L | HidNpadButton_ZL)) != 0) {
     out |= PAD_TRIGGER_L;
   }
-  if ((buttons & HidNpadButton_R) != 0) {
+  if ((buttons & HidNpadButton_ZR) != 0) {
     out |= PAD_TRIGGER_R;
   }
-  if ((buttons & HidNpadButton_ZR) != 0) {
+  if ((buttons & HidNpadButton_R) != 0) {
     out |= PAD_TRIGGER_Z;
   }
   if ((buttons & HidNpadButton_Up) != 0) {
