@@ -220,6 +220,8 @@ BOOL PADIsGCAdapter(u32 port);
 struct SDL_Gamepad* PADGetSDLGamepadForIndex(u32 index);
 /* Returns the first native button which is currently pressed */
 s32 PADGetNativeButtonPressed(u32 port);
+/* True if the given native button id is currently held on port */
+BOOL PADIsNativeButtonDown(u32 port, u32 button);
 /* Returns the first native axis which is currently pulled halfway or more */
 PADSignedNativeAxis PADGetNativeAxisPulled(u32 port);
 void PADRestoreDefaultMapping(u32 port);

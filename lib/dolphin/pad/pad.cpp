@@ -1536,6 +1536,18 @@ int32_t PADGetNativeButtonPressed(const u32 port) {
   return -1;
 }
 
+BOOL PADIsNativeButtonDown(const u32 port, const u32 button) {
+  if (button == static_cast<u32>(PAD_NATIVE_BUTTON_INVALID)) {
+    return FALSE;
+  }
+  const auto* controller = aurora::input::get_controller_for_player(port);
+  if (controller == nullptr || button >= static_cast<u32>(SDL_GAMEPAD_BUTTON_COUNT)) {
+    return FALSE;
+  }
+  return SDL_GetGamepadButton(controller->m_controller, static_cast<SDL_GamepadButton>(button)) != 0u ? TRUE
+                                                                                                       : FALSE;
+}
+
 PADSignedNativeAxis PADGetNativeAxisPulled(const u32 port) {
   const auto* controller = aurora::input::get_controller_for_player(port);
   if (controller == nullptr) {

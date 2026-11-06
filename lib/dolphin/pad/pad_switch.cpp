@@ -619,6 +619,20 @@ s32 PADGetNativeButtonPressed(u32 port) {
   }
   return -1;
 }
+BOOL PADIsNativeButtonDown(u32 port, u32 button) {
+  if (port != PAD_CHAN0 || button == PAD_NATIVE_BUTTON_INVALID) {
+    return FALSE;
+  }
+  ensureInitialized();
+  padUpdate(&s_pad);
+  const u64 held = padGetButtons(&s_pad);
+  for (const auto& b : kSwitchButtons) {
+    if (b.id == button) {
+      return (held & b.hidMask) != 0 ? TRUE : FALSE;
+    }
+  }
+  return FALSE;
+}
 PADSignedNativeAxis PADGetNativeAxisPulled(u32 port) {
   (void)port;
   return {-1, AXIS_SIGN_POSITIVE};
